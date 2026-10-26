@@ -70,13 +70,18 @@ publish_null = mqtt_packets.gen_publish(
     null_topic, qos=qos, payload=null_payload, retain=True, proto_ver=proto_ver
 )
 
-mid = 1
-subscribe_packet = mqtt_packets.gen_subscribe(mid, "#", 0, proto_ver=proto_ver)
-suback_packet = mqtt_packets.gen_suback(mid, qos=0, proto_ver=proto_ver)
+
+def expect_no_retain(sock, topic, mid):
+    subscribe_packet = mqtt_packets.gen_subscribe(mid, topic, 0, proto_ver=proto_ver)
+    suback_packet = mqtt_packets.gen_suback(mid, qos=0, proto_ver=proto_ver)
+    mosq_test.do_send_receive(sock, subscribe_packet, suback_packet, "suback " + topic)
+    mosq_test.do_ping(sock)
+
 
 broker = mosq_test.start_broker(filename=os.path.basename(__file__), use_conf=True, port=port)
 will_persist_sock = None
 will_clean_sock = None
+stde = None
 
 try:
     sock = mosq_test.do_client_connect(connect_packet, connack_packet, timeout=5, port=port)
@@ -105,7 +110,9 @@ try:
         wills=2,
     )
 
-    (broker_terminate_rc, stde) = mosq_test.terminate_broker(broker)
+    # SIGKILL so wills remain in the DB instead of being published on shutdown.
+    broker.kill()
+    mosq_test.wait_for_subprocess(broker)
     broker = None
     will_persist_sock.close()
     will_clean_sock.close()
@@ -113,30 +120,46 @@ try:
     will_clean_sock = None
 
     with persist_help.get_connection(port, readonly=False) as con:
-        con.execute(
+        cur = con.execute(
             "UPDATE base_msgs SET payload = ?, payloadlen = ? WHERE topic = ?",
             (b"X", 1048576, oversized_topic),
         )
-        con.execute(
+        if cur.rowcount != 1:
+            raise ValueError("failed to corrupt oversized retain row")
+        cur = con.execute(
             "UPDATE base_msgs SET payload = NULL, payloadlen = ? WHERE topic = ?",
             (123, null_topic),
         )
-        con.execute(
+        if cur.rowcount != 1:
+            raise ValueError("failed to corrupt NULL-blob retain row")
+        cur = con.execute(
             "UPDATE wills SET payload = ?, payloadlen = ? WHERE client_id = ?",
             (b"Y", 1048576, will_persist_id),
         )
-        con.execute(
+        if cur.rowcount != 1:
+            raise ValueError("failed to corrupt persistent will row")
+        cur = con.execute(
             "UPDATE wills SET payload = NULL, payloadlen = ? WHERE client_id = ?",
             (999, will_clean_id),
         )
+        if cur.rowcount != 1:
+            raise ValueError("failed to corrupt clean-session will row")
         con.commit()
 
     broker = mosq_test.start_broker(filename=os.path.basename(__file__), use_conf=True, port=port)
 
     sock = mosq_test.do_client_connect(connect_packet, connack_packet, timeout=5, port=port)
-    mosq_test.do_send_receive(sock, subscribe_packet, suback_packet, "suback")
+    mid = 1
+    subscribe_packet = mqtt_packets.gen_subscribe(mid, good_topic, 0, proto_ver=proto_ver)
+    suback_packet = mqtt_packets.gen_suback(mid, qos=0, proto_ver=proto_ver)
+    mosq_test.do_send_receive(sock, subscribe_packet, suback_packet, "suback good")
     mosq_test.expect_packet(sock, "good retain", publish_good)
     mosq_test.do_ping(sock)
+
+    expect_no_retain(sock, oversized_topic, 2)
+    expect_no_retain(sock, null_topic, 3)
+    expect_no_retain(sock, will_persist_topic, 4)
+    expect_no_retain(sock, will_clean_topic, 5)
     sock.close()
 
     (broker_terminate_rc, stde) = mosq_test.terminate_broker(broker)
@@ -170,6 +193,7 @@ finally:
     rc += persist_help.cleanup(port)
 
     if rc:
+        print(stde)
         print(mosq_test.broker_log(broker))
 
 
