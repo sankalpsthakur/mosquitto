@@ -240,6 +240,7 @@ tests = [
     (2, './15-persist-client-v5-0.py', 'persist_sqlite'),
     (2, './15-persist-client-will-clean.py', 'persist_sqlite'),
     (2, './15-persist-client-will-persistent.py', 'persist_sqlite'),
+    (2, './15-persist-payloadlen-mismatch.py', 'persist_sqlite'),
     (2, './15-persist-publish-properties-v5-0.py', 'persist_sqlite'),
     (2, './15-persist-retain-clear.py', 'persist_sqlite'),
     (2, './15-persist-retain-v3-1-1.py', 'persist_sqlite'),
