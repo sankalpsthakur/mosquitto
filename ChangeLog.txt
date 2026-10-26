@@ -23,6 +23,8 @@
   thread creation fails. Closes #3496.
 
 # Plugins
+- Fix persist-sqlite restore trusting payloadlen over the SQLite blob size,
+  which could read out of bounds on a corrupted database. Closes #3777.
 - Fix migrate_to_persist_sqlite.py not base64 decoding message payloads when
   migrating. Closes #3492.
 

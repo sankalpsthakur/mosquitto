@@ -14,6 +14,7 @@ SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
 
 Contributors:
    Roger Light - initial implementation and documentation.
+   Sankalp Thakur - validate payloadlen against SQLite blob size.
 */
 
 #include <stdlib.h>
@@ -195,6 +196,45 @@ static mosquitto_property *json_to_properties(const char *json)
 }
 
 
+/* Compare the stored payloadlen column with the actual BLOB size.
+ * sqlite3_column_blob() must be called before sqlite3_column_bytes().
+ * Rejects negative payloadlen, payloadlen > MQTT_MAX_PAYLOAD, and rows where
+ * payloadlen is larger than the blob (including a NULL/empty blob).
+ */
+static int payload_blob_validate(sqlite3_stmt *stmt, int blob_idx, int payloadlen_idx, const void **payload_out, uint32_t *payloadlen_out)
+{
+	int64_t payloadlen;
+	const void *payload;
+	int blob_bytes;
+
+	payloadlen = sqlite3_column_int64(stmt, payloadlen_idx);
+	payload = sqlite3_column_blob(stmt, blob_idx);
+	blob_bytes = sqlite3_column_bytes(stmt, blob_idx);
+
+	if(payloadlen < 0 || payloadlen > (int64_t)MQTT_MAX_PAYLOAD){
+		mosquitto_log_printf(MOSQ_LOG_WARNING,
+				"sqlite: Skipping row, payloadlen %lld is invalid",
+				(long long)payloadlen);
+		return MOSQ_ERR_INVAL;
+	}
+	if(payloadlen > 0 && (!payload || (int64_t)blob_bytes < payloadlen)){
+		mosquitto_log_printf(MOSQ_LOG_WARNING,
+				"sqlite: Skipping row, payloadlen %lld is larger than blob size %d",
+				(long long)payloadlen, blob_bytes);
+		return MOSQ_ERR_INVAL;
+	}
+
+	if(payloadlen == 0){
+		*payload_out = NULL;
+		*payloadlen_out = 0;
+	}else{
+		*payload_out = payload;
+		*payloadlen_out = (uint32_t)payloadlen;
+	}
+	return MOSQ_ERR_SUCCESS;
+}
+
+
 static int client_restore(struct mosquitto_sqlite *ms)
 {
 	sqlite3_stmt *stmt;
@@ -323,8 +363,11 @@ static int base_msg_restore(struct mosquitto_sqlite *ms)
 		}
 		base_msg.source_id = (char *)sqlite3_column_text(stmt, 4);
 		base_msg.source_username = (char *)sqlite3_column_text(stmt, 5);
-		payload = (const void *)sqlite3_column_blob(stmt, 3);
-		base_msg.payloadlen = (uint32_t)sqlite3_column_int(stmt, 6);
+		if(payload_blob_validate(stmt, 3, 6, &payload, &base_msg.payloadlen) != MOSQ_ERR_SUCCESS){
+			mosquitto_free(base_msg.topic);
+			failed++;
+			continue;
+		}
 		if(payload && base_msg.payloadlen){
 			base_msg.payload = mosquitto_malloc(base_msg.payloadlen+1);
 			if(!base_msg.payload){
@@ -469,7 +512,8 @@ static int will_restore(struct mosquitto_sqlite *ms)
 	const char *clientid, *topic;
 	const void *payload;
 	mosquitto_property *properties;
-	int payloadlen, qos, retain;
+	uint32_t payloadlen;
+	int qos, retain;
 
 	rc = sqlite3_prepare_v2(ms->db,
 			"SELECT w.client_id,w.topic,w.payload,w.payloadlen,w.qos,w.retain,w.properties,"
@@ -486,21 +530,25 @@ static int will_restore(struct mosquitto_sqlite *ms)
 	while(sqlite3_step(stmt) == SQLITE_ROW){
 		clientid = (const char *)sqlite3_column_text(stmt, 0);
 		topic = (const char *)sqlite3_column_text(stmt, 1);
-		payload = (const void *)sqlite3_column_blob(stmt, 2);
-		payloadlen = (int)sqlite3_column_int64(stmt, 3);
+		/* Must validate against sqlite3_column_bytes() before will__set() or
+		 * publish_will_msg(); those APIs cannot infer the source buffer length. */
+		if(payload_blob_validate(stmt, 2, 3, &payload, &payloadlen) != MOSQ_ERR_SUCCESS){
+			failed++;
+			continue;
+		}
 		qos = sqlite3_column_int(stmt, 4);
 		retain = (bool)sqlite3_column_int(stmt, 5);
 		properties = json_to_properties((const char *)sqlite3_column_text(stmt, 6));
 
-		rc = mosquitto_client_will_set(clientid, topic, payloadlen, payload, qos, retain, properties);
+		rc = mosquitto_client_will_set(clientid, topic, (int)payloadlen, payload, qos, retain, properties);
 		if(rc == MOSQ_ERR_NOT_FOUND){
 			/* If the client does not exist this is the will message of a non-persistent client. */
-			rc = publish_will_msg(topic, payloadlen, payload, qos, retain, properties);
+			rc = publish_will_msg(topic, (int)payloadlen, payload, qos, retain, properties);
 		}else if(rc == MOSQ_ERR_SUCCESS && (sqlite3_column_int64(stmt, 7) == 0 && sqlite3_column_int64(stmt, 8) == 0)){
 			/* If the client is a persistent client and was connected at the moment of a crash
 				 and has no will delay we publish it's will message now, but need a new copy of the properties. */
 			properties = json_to_properties((const char *)sqlite3_column_text(stmt, 6));
-			rc = publish_will_msg(topic, payloadlen, payload, qos, retain, properties);
+			rc = publish_will_msg(topic, (int)payloadlen, payload, qos, retain, properties);
 		}
 
 		if(rc == MOSQ_ERR_SUCCESS){
